@@ -1,6 +1,22 @@
 package com.myagent.jarvis;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
+import android.net.Uri;
+import android.provider.AlarmClock;
+import android.provider.Settings;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -10,8 +26,12 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.util.ArrayList;
+import java.util.Locale;
 
 /**
  * JARVIS - pehla test build. Sirf screen aur animation hai.
@@ -39,15 +59,24 @@ public class MainActivity extends Activity {
     private ScrollView chatScroll;
     private int state = RingsView.READY;
 
+    private SpeechRecognizer recognizer;
+    private TextToSpeech tts;
+    private boolean ttsReady = false;
+    private boolean torchOn = false;
+    private String partialText = "";
+    private SharedPreferences prefs;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        prefs = getSharedPreferences("jarvis", MODE_PRIVATE);
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         setContentView(buildUi());
         addCard("Hello, I'm JARVIS.\nHow can I help you today?", false);
-        addCard("First test build. The buttons are not connected to the agent yet.", false);
+        addCard("Tap the mic and speak. TORCH, CALL, ALARM and SETTINGS now work.", false);
         setState(RingsView.READY);
+        initTts();
     }
 
     private int dp(float v) {
@@ -160,7 +189,7 @@ public class MainActivity extends Activity {
         FrameLayout hero = new FrameLayout(this);
 
         rings = new RingsView(this);
-        rings.setOnClickListener(v -> cycle());
+        rings.setOnClickListener(v -> onMicTap());
         hero.addView(rings, new FrameLayout.LayoutParams(ringSize, ringSize, Gravity.CENTER));
 
         LinearLayout left = new LinearLayout(this);
@@ -202,7 +231,7 @@ public class MainActivity extends Activity {
         tp.topMargin = dp(4);
         col.addView(t, tp);
 
-        col.setOnClickListener(v -> soon(name));
+        col.setOnClickListener(v -> onSide(name));
         return col;
     }
 
@@ -221,7 +250,7 @@ public class MainActivity extends Activity {
         tapText = label("TAP TO SPEAK", 14, 0.3f, DIM);
         tapText.setGravity(Gravity.CENTER);
         tapText.setBackground(shape(0xFF0B1728, 0xFF1D5A8A, 26));
-        tapText.setOnClickListener(v -> cycle());
+        tapText.setOnClickListener(v -> onMicTap());
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(0, dp(48), 1f);
         tp.leftMargin = dp(6);
         tp.rightMargin = dp(6);
@@ -238,10 +267,228 @@ public class MainActivity extends Activity {
         return bar;
     }
 
-    /** Demo: READY -> LISTENING -> SPEAKING -> READY. Asli mic baad mein judega. */
-    private void cycle() {
-        state = (state + 1) % 3;
-        setState(state);
+    // ---------------- buttons ----------------
+
+    private void onSide(String name) {
+        if (name.equals("TORCH")) {
+            toggleTorch();
+        } else if (name.equals("CALL")) {
+            openDialer();
+        } else if (name.equals("ALARM")) {
+            openAlarms();
+        } else if (name.equals("SETTINGS")) {
+            showSettings();
+        } else {
+            soon(name);
+        }
+    }
+
+    private void toggleTorch() {
+        try {
+            CameraManager cm = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            String[] ids = cm.getCameraIdList();
+            for (String id : ids) {
+                Boolean flash = cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                if (flash != null && flash) {
+                    torchOn = !torchOn;
+                    cm.setTorchMode(id, torchOn);
+                    Toast.makeText(this, torchOn ? "Torch ON" : "Torch OFF", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
+            Toast.makeText(this, "No flashlight found", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Torch error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void openDialer() {
+        try {
+            startActivity(new Intent(Intent.ACTION_DIAL, Uri.parse("tel:")));
+        } catch (Exception e) {
+            Toast.makeText(this, "Cannot open dialer", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void openAlarms() {
+        try {
+            startActivity(new Intent(AlarmClock.ACTION_SHOW_ALARMS));
+        } catch (Exception e) {
+            Toast.makeText(this, "Cannot open alarms", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void showSettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackgroundColor(CARD);
+        box.setPadding(dp(20), dp(16), dp(20), dp(8));
+
+        TextView title = label("SETTINGS", 16, 0.3f, TEXT);
+        box.addView(title);
+
+        Switch voice = new Switch(this);
+        voice.setText("Speak replies aloud");
+        voice.setTextColor(TEXT);
+        voice.setChecked(prefs.getBoolean("speak", true));
+        voice.setPadding(0, dp(16), 0, dp(8));
+        voice.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("speak", on).apply());
+        box.addView(voice);
+
+        TextView hint = label("Microphone permission is managed in Android settings.", 12, 0.02f, DIM);
+        hint.setPadding(0, dp(8), 0, dp(8));
+        box.addView(hint);
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setView(box);
+        b.setPositiveButton("CLOSE", null);
+        b.setNeutralButton("APP PERMISSIONS", (d, w) -> {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+        });
+        b.show();
+    }
+
+    // ---------------- voice ----------------
+
+    private void initTts() {
+        tts = new TextToSpeech(this, st -> {
+            if (st == TextToSpeech.SUCCESS) {
+                int r = tts.setLanguage(new Locale("hi", "IN"));
+                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts.setLanguage(Locale.getDefault());
+                }
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String id) { }
+                    @Override public void onDone(String id) {
+                        runOnUiThread(() -> { if (state == RingsView.SPEAKING) setState(RingsView.READY); });
+                    }
+                    @Override public void onError(String id) {
+                        runOnUiThread(() -> { if (state == RingsView.SPEAKING) setState(RingsView.READY); });
+                    }
+                });
+                ttsReady = true;
+            }
+        });
+    }
+
+    private void onMicTap() {
+        if (state == RingsView.LISTENING) {
+            if (recognizer != null) recognizer.stopListening();
+            return;
+        }
+        if (state == RingsView.SPEAKING) {
+            if (tts != null) tts.stop();
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            return;
+        }
+        startListening();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == 1 && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+            startListening();
+        } else if (code == 1) {
+            Toast.makeText(this, "Microphone permission needed", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void startListening() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "Speech recognition not available on this phone", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            recognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onReadyForSpeech(Bundle p) { }
+                @Override public void onBeginningOfSpeech() { }
+                @Override public void onBufferReceived(byte[] b) { }
+                @Override public void onEvent(int t, Bundle p) { }
+                @Override public void onEndOfSpeech() { rings.setLevel(0f); }
+                @Override public void onRmsChanged(float rms) {
+                    rings.setLevel(Math.max(0f, Math.min(1f, (rms + 2f) / 12f)));
+                }
+                @Override public void onPartialResults(Bundle p) {
+                    ArrayList<String> l = p.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (l != null && !l.isEmpty()) {
+                        partialText = l.get(0);
+                        status.setText(partialText.length() > 28
+                                ? "..." + partialText.substring(partialText.length() - 28) : partialText);
+                    }
+                }
+                @Override public void onResults(Bundle r) {
+                    ArrayList<String> l = r.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    String t = (l != null && !l.isEmpty()) ? l.get(0) : partialText;
+                    heard(t);
+                }
+                @Override public void onError(int e) {
+                    rings.setLevel(0f);
+                    if (partialText.length() > 0 && (e == SpeechRecognizer.ERROR_NO_MATCH
+                            || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                        heard(partialText);
+                        return;
+                    }
+                    setState(RingsView.READY);
+                    if (e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                        status.setText("DID NOT HEAR ANYTHING");
+                    } else {
+                        Toast.makeText(MainActivity.this, "Mic error " + e, Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+        }
+        partialText = "";
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN");
+        i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L);
+        setState(RingsView.LISTENING);
+        recognizer.startListening(i);
+    }
+
+    private void heard(String text) {
+        rings.setLevel(0f);
+        if (text == null || text.trim().isEmpty()) {
+            setState(RingsView.READY);
+            return;
+        }
+        addCard(text, true);
+        String low = text.toLowerCase(Locale.ROOT);
+        String reply;
+        if (low.contains("torch") || low.contains("flash") || text.contains("टॉर्च") || text.contains("टोर्च")) {
+            toggleTorch();
+            reply = torchOn ? "Torch on" : "Torch off";
+        } else if (low.contains("alarm") || text.contains("अलार्म")) {
+            openAlarms();
+            reply = "Opening alarms";
+        } else if (low.contains("call") || text.contains("कॉल")) {
+            openDialer();
+            reply = "Opening dialer";
+        } else {
+            reply = "I heard you. The AI brain is not connected yet.";
+        }
+        addCard(reply, false);
+        if (prefs.getBoolean("speak", true) && ttsReady) {
+            setState(RingsView.SPEAKING);
+            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "u1");
+        } else {
+            setState(RingsView.READY);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (recognizer != null) recognizer.destroy();
+        if (tts != null) { tts.stop(); tts.shutdown(); }
+        super.onDestroy();
     }
 
     private void setState(int s) {
