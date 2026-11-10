@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -30,6 +31,13 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Locale;
 
@@ -74,7 +82,7 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         setContentView(buildUi());
         addCard("Hello, I'm JARVIS.\nHow can I help you today?", false);
-        addCard("Tap the mic and speak. TORCH, CALL, ALARM and SETTINGS now work.", false);
+        addCard("Tap the mic and speak. Start the bridge in Termux (jarvis-bridge), then paste the agent key in SETTINGS.", false);
         setState(RingsView.READY);
         initTts();
     }
@@ -327,6 +335,15 @@ public class MainActivity extends Activity {
         TextView title = label("SETTINGS", 16, 0.3f, TEXT);
         box.addView(title);
 
+        TextView kl = label("Agent key (shown in Termux by jarvis-bridge)", 12, 0.05f, DIM);
+        kl.setPadding(0, dp(14), 0, dp(4));
+        box.addView(kl);
+        final EditText key = new EditText(this);
+        key.setText(prefs.getString("token", ""));
+        key.setTextColor(TEXT);
+        key.setSingleLine(true);
+        box.addView(key);
+
         Switch voice = new Switch(this);
         voice.setText("Speak replies aloud");
         voice.setTextColor(TEXT);
@@ -341,7 +358,7 @@ public class MainActivity extends Activity {
 
         AlertDialog.Builder b = new AlertDialog.Builder(this);
         b.setView(box);
-        b.setPositiveButton("CLOSE", null);
+        b.setPositiveButton("SAVE", (d, w) -> prefs.edit().putString("token", key.getText().toString().trim()).apply());
         b.setNeutralButton("APP PERMISSIONS", (d, w) -> {
             Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     Uri.parse("package:" + getPackageName()));
@@ -461,24 +478,63 @@ public class MainActivity extends Activity {
             return;
         }
         addCard(text, true);
-        String low = text.toLowerCase(Locale.ROOT);
-        String reply;
-        if (low.contains("torch") || low.contains("flash") || text.contains("टॉर्च") || text.contains("टोर्च")) {
-            toggleTorch();
-            reply = torchOn ? "Torch on" : "Torch off";
-        } else if (low.contains("alarm") || text.contains("अलार्म")) {
-            openAlarms();
-            reply = "Opening alarms";
-        } else if (low.contains("call") || text.contains("कॉल")) {
-            openDialer();
-            reply = "Opening dialer";
-        } else {
-            reply = "I heard you. The AI brain is not connected yet.";
+        setState(RingsView.READY);
+        status.setText("THINKING...");
+        final String q = text;
+        new Thread(() -> {
+            String reply = askAgent(q);
+            runOnUiThread(() -> answer(reply));
+        }).start();
+    }
+
+    /** Termux wale bridge ko sawal bhejta hai. Galti par "!..." code lautata hai. */
+    private String askAgent(String text) {
+        String token = prefs.getString("token", "");
+        if (token.isEmpty()) return "!NOTOKEN";
+        try {
+            URL u = new URL("http://127.0.0.1:8765/ask");
+            HttpURLConnection c = (HttpURLConnection) u.openConnection();
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(90000);
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            c.setRequestProperty("X-Token", token);
+            JSONObject j = new JSONObject();
+            j.put("text", text);
+            OutputStream os = c.getOutputStream();
+            os.write(j.toString().getBytes("UTF-8"));
+            os.close();
+            int code = c.getResponseCode();
+            if (code == 401) return "!BADTOKEN";
+            InputStream is = code < 400 ? c.getInputStream() : c.getErrorStream();
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
+            if (code >= 400) return "!ERROR " + code;
+            return new JSONObject(bo.toString("UTF-8")).getString("reply");
+        } catch (Exception e) {
+            return "!OFFLINE";
         }
-        addCard(reply, false);
-        if (prefs.getBoolean("speak", true) && ttsReady) {
+    }
+
+    private void answer(String r) {
+        String msg = r;
+        if (r.equals("!NOTOKEN")) {
+            msg = "Agent key is not set. Open SETTINGS and paste the key shown in Termux.";
+        } else if (r.equals("!BADTOKEN")) {
+            msg = "Agent key is wrong. Copy it again from Termux into SETTINGS.";
+        } else if (r.equals("!OFFLINE")) {
+            msg = "Agent is offline. In Termux run: jarvis-bridge";
+        } else if (r.equals("EXIT")) {
+            msg = "Okay.";
+        }
+        addCard(msg, false);
+        if (state == RingsView.LISTENING) return;
+        if (prefs.getBoolean("speak", true) && ttsReady && !r.startsWith("!")) {
             setState(RingsView.SPEAKING);
-            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "u1");
+            tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "u1");
         } else {
             setState(RingsView.READY);
         }
