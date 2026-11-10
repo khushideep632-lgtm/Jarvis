@@ -20,6 +20,8 @@ import android.speech.tts.UtteranceProgressListener;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -71,8 +73,16 @@ public class MainActivity extends Activity {
     private TextToSpeech tts;
     private boolean ttsReady = false;
     private boolean torchOn = false;
-    private String partialText = "";
     private SharedPreferences prefs;
+    private boolean conversationOn = false;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable delayedListen = () -> {
+        if (state == RingsView.READY && conversationOn
+                && prefs.getBoolean("continuous", true)) {
+            startListening();
+        }
+    };
+    private String partialText = "";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -352,6 +362,20 @@ public class MainActivity extends Activity {
         voice.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("speak", on).apply());
         box.addView(voice);
 
+        Switch continuous = new Switch(this);
+        continuous.setText("Continuous conversation");
+        continuous.setTextColor(TEXT);
+        continuous.setChecked(prefs.getBoolean("continuous", true));
+        continuous.setPadding(0, dp(8), 0, dp(8));
+        continuous.setOnCheckedChangeListener((b, on) -> {
+            prefs.edit().putBoolean("continuous", on).apply();
+            if (!on) {
+                conversationOn = false;
+                cancelDelayedListen();
+            }
+        });
+        box.addView(continuous);
+
         TextView hint = label("Microphone permission is managed in Android settings.", 12, 0.02f, DIM);
         hint.setPadding(0, dp(8), 0, dp(8));
         box.addView(hint);
@@ -379,10 +403,22 @@ public class MainActivity extends Activity {
                 tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                     @Override public void onStart(String id) { }
                     @Override public void onDone(String id) {
-                        runOnUiThread(() -> { if (state == RingsView.SPEAKING) setState(RingsView.READY); });
+                        runOnUiThread(() -> {
+                            if (state == RingsView.SPEAKING) {
+                                setState(RingsView.READY);
+                                scheduleNextListening();
+                            }
+                        });
                     }
                     @Override public void onError(String id) {
-                        runOnUiThread(() -> { if (state == RingsView.SPEAKING) setState(RingsView.READY); });
+                        runOnUiThread(() -> {
+                            if (state == RingsView.SPEAKING) setState(RingsView.READY);
+                        });
+                    }
+                    @Override public void onStop(String id, boolean interrupted) {
+                        runOnUiThread(() -> {
+                            if (state == RingsView.SPEAKING) setState(RingsView.READY);
+                        });
                     }
                 });
                 ttsReady = true;
@@ -391,18 +427,32 @@ public class MainActivity extends Activity {
     }
 
     private void onMicTap() {
-        if (state == RingsView.LISTENING) {
-            if (recognizer != null) recognizer.stopListening();
+        if (state == RingsView.LISTENING || state == RingsView.SPEAKING) {
+            conversationOn = false;
+            cancelDelayedListen();
+            if (state == RingsView.LISTENING && recognizer != null) recognizer.cancel();
+            if (state == RingsView.SPEAKING && tts != null) tts.stop();
+            setState(RingsView.READY);
             return;
         }
-        if (state == RingsView.SPEAKING) {
-            if (tts != null) tts.stop();
-        }
+        cancelDelayedListen();
+        conversationOn = prefs.getBoolean("continuous", true);
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
             return;
         }
         startListening();
+    }
+
+    private void cancelDelayedListen() {
+        mainHandler.removeCallbacks(delayedListen);
+    }
+
+    private void scheduleNextListening() {
+        cancelDelayedListen();
+        if (conversationOn && prefs.getBoolean("continuous", true)) {
+            mainHandler.postDelayed(delayedListen, 600);
+        }
     }
 
     @Override
@@ -411,12 +461,16 @@ public class MainActivity extends Activity {
         if (code == 1 && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
             startListening();
         } else if (code == 1) {
+            conversationOn = false;
             Toast.makeText(this, "Microphone permission needed", Toast.LENGTH_SHORT).show();
         }
     }
 
     private void startListening() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            conversationOn = false;
+            cancelDelayedListen();
+            setState(RingsView.READY);
             Toast.makeText(this, "Speech recognition not available on this phone", Toast.LENGTH_LONG).show();
             return;
         }
@@ -446,11 +500,8 @@ public class MainActivity extends Activity {
                 }
                 @Override public void onError(int e) {
                     rings.setLevel(0f);
-                    if (partialText.length() > 0 && (e == SpeechRecognizer.ERROR_NO_MATCH
-                            || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
-                        heard(partialText);
-                        return;
-                    }
+                    conversationOn = false;
+                    cancelDelayedListen();
                     setState(RingsView.READY);
                     if (e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
                         status.setText("DID NOT HEAR ANYTHING");
@@ -474,6 +525,18 @@ public class MainActivity extends Activity {
     private void heard(String text) {
         rings.setLevel(0f);
         if (text == null || text.trim().isEmpty()) {
+            conversationOn = false;
+            cancelDelayedListen();
+            setState(RingsView.READY);
+            return;
+        }
+        String stopText = text.trim().toLowerCase(Locale.ROOT);
+        if (stopText.equals("bas") || stopText.equals("ruko") || stopText.equals("stop")
+                || stopText.equals("बस") || stopText.equals("रुको") || stopText.equals("बस करो")
+                || stopText.equals("रुक जाओ")) {
+            conversationOn = false;
+            cancelDelayedListen();
+            addCard("Okay.", false);
             setState(RingsView.READY);
             return;
         }
@@ -531,17 +594,26 @@ public class MainActivity extends Activity {
             msg = "Okay.";
         }
         addCard(msg, false);
+        if (r.startsWith("!")) {
+            conversationOn = false;
+            cancelDelayedListen();
+            setState(RingsView.READY);
+            return;
+        }
         if (state == RingsView.LISTENING) return;
-        if (prefs.getBoolean("speak", true) && ttsReady && !r.startsWith("!")) {
+        if (prefs.getBoolean("speak", true) && ttsReady) {
             setState(RingsView.SPEAKING);
             tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "u1");
         } else {
             setState(RingsView.READY);
+            scheduleNextListening();
         }
     }
 
     @Override
     protected void onDestroy() {
+        conversationOn = false;
+        cancelDelayedListen();
         if (recognizer != null) recognizer.destroy();
         if (tts != null) { tts.stop(); tts.shutdown(); }
         super.onDestroy();
